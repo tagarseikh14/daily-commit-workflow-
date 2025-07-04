@@ -1,0 +1,139 @@
+name: Dynamic Daily Activity Logger
+
+on:
+  schedule:
+    # Runs daily at midnight UTC. Adjust '0 0 * * *' for your desired time.
+    # For example, '0 12 * * *' for noon UTC. Cron syntax: minute hour day_of_month month day_of_week
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      log_filename: # Renamed for clarity - this file will accumulate entries
+        description: 'Name of the activity log file to append to'
+        required: false
+        default: 'daily_activity_log.txt' # Default log file name
+      commit_prefix:
+        description: 'Prefix for the automated commit message (used if no custom message)'
+        required: false
+        default: 'chore: Daily activity log update' # Default commit message prefix
+      custom_message:
+        description: 'Optional custom message for the commit itself. This will override the commit_prefix.'
+        required: false
+        default: '' # By default, no custom message
+      custom_log_entry: # NEW INPUT: Allows adding a specific line to the log file
+        description: 'Optional custom content to add as a new line in the activity log file.'
+        required: false
+        default: ''
+
+jobs:
+  update-activity-log: # Job name changed to reflect logging
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # This permission is crucial for the GITHUB_TOKEN to commit and push.
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetches full history for 'git diff-index' to work reliably
+
+      - name: Configure Git User
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          echo "::notice::Git user configured as 'github-actions[bot]'."
+
+      - name: Prepare Daily Log Entry and Detect Changes
+        id: prepare_log_entry
+        run: |
+          echo "::group::Preparing Log Entry and Checking for Changes"
+
+          LOG_FILE="${{ github.event.inputs.log_filename || 'daily_activity_log.txt' }}"
+          COUNT_FILE="activity_count.txt" # File to store the persistent counter (still overwritten)
+          
+          # Retrieve inputs for commit message and log entry
+          COMMIT_PREFIX="${{ github.event.inputs.commit_prefix || 'chore: Daily activity log update' }}"
+          CUSTOM_COMMIT_MESSAGE="${{ github.event.inputs.custom_message }}"
+          CUSTOM_LOG_ENTRY="${{ github.event.inputs.custom_log_entry }}"
+          
+          CURRENT_DATE_TIME=$(date '+%Y-%m-%d %H:%M:%S %Z')
+
+          # --- Read and Increment Persistent Counter ---
+          CURRENT_COUNT=0
+          if [ -f "$COUNT_FILE" ]; then
+            CURRENT_COUNT=$(cat "$COUNT_FILE" | tr -d '\n\r') # Read existing count, remove newlines
+            if ! [[ "$CURRENT_COUNT" =~ ^[0-9]+$ ]]; then # Validate if it's a number
+                CURRENT_COUNT=0
+                echo "::warning::Invalid content in '$COUNT_FILE', resetting counter to 0."
+            fi
+          fi
+          NEXT_COUNT=$((CURRENT_COUNT + 1))
+          echo "$NEXT_COUNT" > "$COUNT_FILE" # Overwrite count file with new count
+          echo "::notice::Activity counter updated to: $NEXT_COUNT."
+
+          # --- Generate New Log Line to Append ---
+          # Use a timestamp for each log entry to ensure uniqueness and order
+          NEW_LOG_LINE="[${CURRENT_DATE_TIME}] (Run #${NEXT_COUNT}): "
+          
+          if [ -n "$CUSTOM_LOG_ENTRY" ]; then
+            NEW_LOG_LINE+="${CUSTOM_LOG_ENTRY}" # Add custom log entry if provided
+            echo "::notice::Adding custom log entry: '${CUSTOM_LOG_ENTRY}'"
+          else
+            NEW_LOG_LINE+="Automated daily check-in." # Default automated message
+            echo "::notice::Adding default automated log entry."
+          fi
+
+          # Append the new line to the activity log file
+          # The '>>' operator is crucial here for appending instead of overwriting
+          echo "${NEW_LOG_LINE}" >> "${LOG_FILE}"
+          echo "::notice::Appended new line to '${LOG_FILE}':"
+          echo "  ${NEW_LOG_LINE}"
+          
+          # --- Prepare Commit Message ---
+          # Add contextual info (Run #, Date) to all commit messages
+          COMMIT_MESSAGE_SUFFIX="(Run #${NEXT_COUNT}, Date: $(date '+%Y-%m-%d'))"
+          
+          FINAL_COMMIT_MESSAGE=""
+          if [ -n "$CUSTOM_COMMIT_MESSAGE" ]; then
+            FINAL_COMMIT_MESSAGE="${CUSTOM_COMMIT_MESSAGE} ${COMMIT_MESSAGE_SUFFIX}"
+            echo "::notice::Using custom commit message: '${CUSTOM_COMMIT_MESSAGE}'"
+          else
+            # Default commit message includes the latest log entry for quick context
+            FINAL_COMMIT_MESSAGE="${COMMIT_PREFIX} - ${NEW_LOG_LINE} ${COMMIT_MESSAGE_SUFFIX}"
+            echo "::notice::Using default commit message based on log prefix and new entry."
+          fi
+          
+          echo "commit_message=$FINAL_COMMIT_MESSAGE" >> "$GITHUB_OUTPUT" # Set as output for next step
+
+          # --- Detect if any changes were actually made to the repository ---
+          # Stage both the log file and the counter file
+          git add "${LOG_FILE}" "${COUNT_FILE}"
+          
+          if git diff-index --quiet HEAD --; then # Checks if staged changes differ from HEAD
+            echo "change_made=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No actual changes detected in the repository after updates. Skipping commit."
+            git reset HEAD # Unstage changes if no commit needed
+          else
+            echo "change_made=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Changes detected. Proceeding to commit."
+          fi
+          echo "::endgroup::"
+
+      - name: Commit & Push Changes
+        if: steps.prepare_log_entry.outputs.change_made == 'true' # Only run if changes detected
+        env:
+          GIT_COMMIT_MESSAGE: ${{ steps.prepare_log_entry.outputs.commit_message }}
+        run: |
+          echo "::group::Committing and Pushing Changes"
+          # '|| true' handles edge case where 'git commit' might report no changes
+          git commit -m "$GIT_COMMIT_MESSAGE" || true 
+          
+          # Explicitly use GITHUB_TOKEN for pushing to ensure proper authentication
+          git push https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}
+          echo "::notice::Successfully committed and pushed changes to ${{ github.ref_name }}."
+          echo "::endgroup::"
+
+      - name: Report No Changes (Optional)
+        if: steps.prepare_log_entry.outputs.change_made == 'false'
+        run: |
+          echo "::notice::Workflow ran, but no changes were detected or needed to be committed."
+          echo "::warning::To ensure distinct days count, please make sure the content actually changes daily."
